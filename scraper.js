@@ -10,8 +10,49 @@ const KV_HEADERS = { 'Authorization': `Bearer ${CF_API_TOKEN}`, 'Content-Type': 
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Accept-Language': 'en-US,en;q=0.5'
+  'Accept-Language': 'en-US,en;q=0.5',
+  'Cache-Control': 'no-cache'
 };
+
+// ============================================================
+// HELPER: bestRate — multiple sources mein se valid aur sab se
+//          zyada reliable rate choose karo
+//   strategy:
+//     'median'  — outliers reject, middle value lo   (currencies, metals)
+//     'first'   — pehla valid source use karo         (fuel)
+//     'avg'     — simple average                      (agriculture)
+// ============================================================
+function bestRate(values, strategy = 'median', label = '') {
+  const valid = values.filter(v => v !== null && v !== undefined && !isNaN(v) && v > 0);
+  if (valid.length === 0) return null;
+  if (valid.length === 1) return valid[0];
+
+  if (strategy === 'first') return valid[0];
+
+  if (strategy === 'avg') {
+    return Math.round(valid.reduce((a, b) => a + b, 0) / valid.length);
+  }
+
+  // median — sorted middle value (outlier-safe)
+  const sorted = [...valid].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const result = sorted.length % 2 === 0
+    ? (sorted[mid - 1] + sorted[mid]) / 2
+    : sorted[mid];
+
+  console.log(`  [${label}] Sources: [${valid.join(', ')}] → Best: ${result}`);
+  return result;
+}
+
+async function fetchSafe(url, options = {}) {
+  try {
+    const res = await axios.get(url, { timeout: 15000, headers: BROWSER_HEADERS, ...options });
+    return res.data;
+  } catch (e) {
+    console.log(`  ⚠ Fetch fail: ${url} — ${e.message}`);
+    return null;
+  }
+}
 
 async function kvGet(key) {
   try {
@@ -31,6 +72,7 @@ function todayDate() {
 }
 
 function updateHistory(history, rateName, newRate) {
+  if (!newRate || newRate <= 0) return history;
   if (!history[rateName]) history[rateName] = [];
   const today = todayDate();
   const existing = history[rateName].findIndex(e => e.date === today);
@@ -50,206 +92,594 @@ function updateHistory(history, rateName, newRate) {
 }
 
 // ============================================================
-// CATEGORY 1: CURRENCIES (10)
+// CATEGORY 1: CURRENCIES
+// Source 1: hamariweb.com  (open market table)
+// Source 2: pkr.com.pk     (open market rates)
+// Source 3: forex.pk       (daily open market)
 // ============================================================
 async function scrapeCurrencies() {
-  try {
-    const res = await axios.get('https://www.hamariweb.com/finance/forex/open_market_rates.aspx', {
-      timeout: 15000, headers: BROWSER_HEADERS
-    });
-    const $ = cheerio.load(res.data);
-    const rates = { usd: 278.5, aed: 75.8, sar: 74.2, eur: 305.0, gbp: 352.0, cny: 38.5, try: 8.1, cad: 204.0, aud: 181.0, qar: 76.5 };
+  console.log('\n[CURRENCIES] Scraping 3 sources...');
+
+  const FALLBACK = { usd: 278.5, aed: 75.8, sar: 74.2, eur: 305.0, gbp: 352.0, cny: 38.5, try: 8.1, cad: 204.0, aud: 181.0, qar: 76.5 };
+
+  // --- Per-currency buckets to collect values from all sources ---
+  const buckets = {};
+  Object.keys(FALLBACK).forEach(k => buckets[k] = []);
+
+  // Helper: parse a table row and push into buckets
+  function parseRow($, row) {
+    const cells = $(row).find('td');
+    if (cells.length < 3) return;
+    const name = $(cells[0]).text().toLowerCase().trim();
+    const sell = parseFloat($(cells[2]).text().replace(/,/g, '').trim());
+    if (!sell || sell <= 0) return;
+    if (name.includes('us dollar') || name.includes('usd'))         buckets.usd.push(sell);
+    if (name.includes('uae') || name.includes('dirham'))            buckets.aed.push(sell);
+    if (name.includes('saudi') || name.includes('riyal') || name.includes('sar')) buckets.sar.push(sell);
+    if (name.includes('euro'))                                       buckets.eur.push(sell);
+    if (name.includes('pound') || name.includes('gbp'))             buckets.gbp.push(sell);
+    if (name.includes('yuan') || name.includes('chinese') || name.includes('cny')) buckets.cny.push(sell);
+    if (name.includes('turkish') || name.includes('lira'))          buckets.try.push(sell);
+    if (name.includes('canadian') || name.includes('cad'))          buckets.cad.push(sell);
+    if (name.includes('australian') || name.includes('aud'))        buckets.aud.push(sell);
+    if (name.includes('qatari') || name.includes('qar'))            buckets.qar.push(sell);
+  }
+
+  // SOURCE 1: hamariweb.com
+  const html1 = await fetchSafe('https://www.hamariweb.com/finance/forex/open_market_rates.aspx');
+  if (html1) {
+    const $ = cheerio.load(html1);
+    $('table tr').each((i, row) => parseRow($, row));
+    console.log('  Source 1 (hamariweb) done');
+  }
+
+  // SOURCE 2: pkr.com.pk
+  const html2 = await fetchSafe('https://www.pkr.com.pk/open-market/');
+  if (html2) {
+    const $ = cheerio.load(html2);
     $('table tr').each((i, row) => {
       const cells = $(row).find('td');
-      if (cells.length < 3) return;
+      if (cells.length < 2) return;
       const name = $(cells[0]).text().toLowerCase().trim();
-      const sell = parseFloat($(cells[2]).text().replace(/,/g, '').trim());
+      // pkr.com usually: Currency | Buy | Sell
+      const sell = parseFloat($(cells[cells.length - 1]).text().replace(/,/g, '').trim());
       if (!sell || sell <= 0) return;
-      if (name.includes('us dollar') || name.includes('usd')) rates.usd = sell;
-      else if (name.includes('uae') || name.includes('dirham') || name.includes('aed')) rates.aed = sell;
-      else if (name.includes('saudi') || name.includes('riyal') || name.includes('sar')) rates.sar = sell;
-      else if (name.includes('euro') || name.includes('eur')) rates.eur = sell;
-      else if (name.includes('pound') || name.includes('gbp')) rates.gbp = sell;
-      else if (name.includes('yuan') || name.includes('chinese') || name.includes('cny')) rates.cny = sell;
-      else if (name.includes('turkish') || name.includes('lira') || name.includes('try')) rates.try = sell;
-      else if (name.includes('canadian') || name.includes('cad')) rates.cad = sell;
-      else if (name.includes('australian') || name.includes('aud')) rates.aud = sell;
-      else if (name.includes('qatari') || name.includes('qar')) rates.qar = sell;
+      if (name.includes('us dollar') || name.includes('usd'))         buckets.usd.push(sell);
+      if (name.includes('uae') || name.includes('dirham'))            buckets.aed.push(sell);
+      if (name.includes('saudi') || name.includes('riyal'))           buckets.sar.push(sell);
+      if (name.includes('euro'))                                       buckets.eur.push(sell);
+      if (name.includes('pound') || name.includes('gbp'))             buckets.gbp.push(sell);
+      if (name.includes('yuan') || name.includes('chinese'))          buckets.cny.push(sell);
+      if (name.includes('turkish') || name.includes('lira'))          buckets.try.push(sell);
+      if (name.includes('canadian') || name.includes('cad'))          buckets.cad.push(sell);
+      if (name.includes('australian') || name.includes('aud'))        buckets.aud.push(sell);
+      if (name.includes('qatari') || name.includes('qar'))            buckets.qar.push(sell);
     });
-    console.log('Currencies scraped:', rates);
-    return rates;
-  } catch (e) {
-    console.log('Currencies scrape fail, fallback use kar raha hoon:', e.message);
-    return { usd: 278.5, aed: 75.8, sar: 74.2, eur: 305.0, gbp: 352.0, cny: 38.5, try: 8.1, cad: 204.0, aud: 181.0, qar: 76.5 };
+    console.log('  Source 2 (pkr.com.pk) done');
   }
+
+  // SOURCE 3: forex.pk — JSON endpoint
+  const html3 = await fetchSafe('https://forex.pk/open-market-rates/');
+  if (html3) {
+    const $ = cheerio.load(html3);
+    $('table tr, .rate-row').each((i, row) => parseRow($, row));
+    console.log('  Source 3 (forex.pk) done');
+  }
+
+  // Pick best (median) for each currency
+  const result = {};
+  Object.keys(FALLBACK).forEach(k => {
+    result[k] = bestRate(buckets[k], 'median', k) || FALLBACK[k];
+  });
+
+  console.log('  Final currencies:', result);
+  return result;
 }
 
 // ============================================================
-// CATEGORY 2: GOLD & METALS (5)
+// CATEGORY 2: GOLD & METALS
+// Source 1: bullion.pk       (static HTML, reliable)
+// Source 2: goldratepk.com   (static HTML table)
+// Source 3: sarafa.com.pk    (Karachi Sarafa Association)
 // ============================================================
 async function scrapeMetals() {
-  try {
-    const res = await axios.get('https://gold.pk/', {
-      timeout: 15000, headers: BROWSER_HEADERS
-    });
-    const $ = cheerio.load(res.data);
-    let gold24k = 490000, gold22k = 449200, goldGram = 42000, silverTola = 7800;
+  console.log('\n[METALS] Scraping 3 sources...');
 
-    $('table tr, .rate-row, .gold-rate').each((i, row) => {
-      const text = $(row).text();
+  const FALLBACK = { gold24k: 245000, gold22k: 224600, goldGram: 21000, silverTola: 2800, platinum: 15925 };
+
+  const b = { gold24k: [], gold22k: [], goldGram: [], silverTola: [] };
+
+  // SOURCE 1: bullion.pk
+  const html1 = await fetchSafe('https://www.bullion.pk/');
+  if (html1) {
+    const $ = cheerio.load(html1);
+    $('table tr, .price-row, .rate-item').each((i, row) => {
+      const text = $(row).text().toLowerCase();
+      const cells = $(row).find('td');
+      const val = parseFloat(
+        (cells.length > 1 ? $(cells[1]).text() : $(row).text())
+          .replace(/,/g, '').replace(/rs\.?/gi, '').trim()
+      );
+      if (!val || val <= 0) return;
+      if (text.includes('24') && (text.includes('tola') || text.includes('karat'))) b.gold24k.push(val);
+      if (text.includes('22') && (text.includes('tola') || text.includes('karat'))) b.gold22k.push(val);
+      if (text.includes('gram') && text.includes('24'))  b.goldGram.push(val);
+      if (text.includes('silver') && text.includes('tola')) b.silverTola.push(val);
+    });
+    console.log('  Source 1 (bullion.pk) done');
+  }
+
+  // SOURCE 2: goldratepk.com
+  const html2 = await fetchSafe('https://www.goldratepk.com/');
+  if (html2) {
+    const $ = cheerio.load(html2);
+    $('table tr, .gold-rate-box, .rate-box').each((i, row) => {
+      const text = $(row).text().toLowerCase();
+      const numStr = $(row).text().replace(/[^0-9,.]/g, '').replace(/,/g, '').trim();
+      const val = parseFloat(numStr);
+      if (!val || val <= 0) return;
+      if (text.includes('24') && text.includes('tola'))  b.gold24k.push(val);
+      if (text.includes('22') && text.includes('tola'))  b.gold22k.push(val);
+      if (text.includes('gram'))                          b.goldGram.push(val);
+      if (text.includes('silver'))                        b.silverTola.push(val);
+    });
+    console.log('  Source 2 (goldratepk.com) done');
+  }
+
+  // SOURCE 3: gold.com.pk
+  const html3 = await fetchSafe('https://gold.com.pk/');
+  if (html3) {
+    const $ = cheerio.load(html3);
+    $('table tr, .rate, [class*="gold"]').each((i, row) => {
+      const text = $(row).text().toLowerCase();
       const cells = $(row).find('td');
       if (cells.length < 2) return;
-      const label = $(cells[0]).text().toLowerCase().trim();
       const val = parseFloat($(cells[1]).text().replace(/,/g, '').replace(/rs\.?/gi, '').trim());
       if (!val || val <= 0) return;
-      if (label.includes('24') && label.includes('tola')) gold24k = val;
-      else if (label.includes('22') && label.includes('tola')) gold22k = val;
-      else if (label.includes('gram') && label.includes('24')) goldGram = val;
-      else if (label.includes('silver') && label.includes('tola')) silverTola = val;
+      if (text.includes('24') && text.includes('tola'))  b.gold24k.push(val);
+      if (text.includes('22') && text.includes('tola'))  b.gold22k.push(val);
+      if (text.includes('gram') && text.includes('24'))  b.goldGram.push(val);
+      if (text.includes('silver'))                        b.silverTola.push(val);
     });
-
-    // Platinum international se calculate karo (gold se approximate)
-    const platinum = Math.round(gold24k * 0.065);
-
-    console.log('Metals scraped:', { gold24k, gold22k, goldGram, silverTola, platinum });
-    return { gold24k, gold22k, goldGram, silverTola, platinum };
-  } catch (e) {
-    console.log('Metals scrape fail, fallback:', e.message);
-    return { gold24k: 490000, gold22k: 449200, goldGram: 42000, silverTola: 7800, platinum: 31850 };
+    console.log('  Source 3 (gold.com.pk) done');
   }
+
+  const gold24k    = bestRate(b.gold24k,    'median', 'gold24k')    || FALLBACK.gold24k;
+  const gold22k    = bestRate(b.gold22k,    'median', 'gold22k')    || FALLBACK.gold22k;
+  const goldGram   = bestRate(b.goldGram,   'median', 'goldGram')   || FALLBACK.goldGram;
+  const silverTola = bestRate(b.silverTola, 'median', 'silverTola') || FALLBACK.silverTola;
+  const platinum   = Math.round(gold24k * 0.065);
+
+  const result = { gold24k, gold22k, goldGram, silverTola, platinum };
+  console.log('  Final metals:', result);
+  return result;
 }
 
 // ============================================================
-// CATEGORY 3: FUEL (4)
+// CATEGORY 3: FUEL
+// Source 1: PakWheels petrol page (static HTML)
+// Source 2: hamariweb fuel page   (static HTML)
+// Source 3: propakistani fuel     (news-based, static)
 // ============================================================
 async function scrapeFuel() {
-  try {
-    const res = await axios.get('https://www.ogra.org.pk/petroleum-products', {
-      timeout: 15000, headers: BROWSER_HEADERS
-    });
-    const $ = cheerio.load(res.data);
-    let petrol = 289, diesel = 283, kerosene = 186, lightDiesel = 178;
+  console.log('\n[FUEL] Scraping 3 sources...');
 
-    $('table tr').each((i, row) => {
-      const cells = $(row).find('td');
-      if (cells.length < 3) return;
-      const text = $(row).text().toLowerCase();
-      const val = parseFloat($(cells[cells.length - 1]).text().replace(/,/g, '').trim());
-      if (!val || val <= 0) return;
-      if (text.includes('petrol') || text.includes('motor spirit') || text.includes(' ms ')) petrol = val;
-      else if (text.includes('high speed diesel') || text.includes('hsd')) diesel = val;
-      else if (text.includes('kerosene')) kerosene = val;
-      else if (text.includes('light diesel') || text.includes('ldo')) lightDiesel = val;
-    });
+  const FALLBACK = { petrol: 255, diesel: 268, kerosene: 186, lightDiesel: 178 };
+  const b = { petrol: [], diesel: [], kerosene: [], lightDiesel: [] };
 
-    console.log('Fuel scraped:', { petrol, diesel, kerosene, lightDiesel });
-    return { petrol, diesel, kerosene, lightDiesel };
-  } catch (e) {
-    console.log('Fuel scrape fail, fallback:', e.message);
-    return { petrol: 289, diesel: 283, kerosene: 186, lightDiesel: 178 };
+  function parseFuelRow($, row) {
+    const text = $(row).text().toLowerCase();
+    const cells = $(row).find('td');
+    const val = parseFloat(
+      $(cells.length > 0 ? cells[cells.length - 1] : row)
+        .text().replace(/,/g, '').replace(/rs\.?/gi, '').trim()
+    );
+    if (!val || val <= 0 || val > 500) return; // sanity check: fuel 500 se zyada nahi
+    if (text.includes('petrol') || text.includes('motor spirit') || text.includes(' ms ')) b.petrol.push(val);
+    if (text.includes('high speed diesel') || text.includes(' hsd ') || text.includes('diesel')) b.diesel.push(val);
+    if (text.includes('kerosene')) b.kerosene.push(val);
+    if (text.includes('light diesel') || text.includes(' ldo ')) b.lightDiesel.push(val);
   }
+
+  // SOURCE 1: PakWheels — fuel price page (static, reliable)
+  const html1 = await fetchSafe('https://www.pakwheels.com/fuel-prices/');
+  if (html1) {
+    const $ = cheerio.load(html1);
+    // PakWheels usually shows price in spans/divs too
+    $('table tr, .fuel-price-row, [class*="fuel"]').each((i, row) => parseFuelRow($, row));
+    // Also try grabbing numbers from text blocks
+    $('[class*="price"], [class*="rate"]').each((i, el) => {
+      const val = parseFloat($(el).text().replace(/,/g, '').replace(/rs\.?/gi, '').trim());
+      const parentText = $(el).parent().text().toLowerCase();
+      if (!val || val <= 0 || val > 500) return;
+      if (parentText.includes('petrol'))  b.petrol.push(val);
+      if (parentText.includes('diesel'))  b.diesel.push(val);
+    });
+    console.log('  Source 1 (pakwheels) done');
+  }
+
+  // SOURCE 2: hamariweb fuel
+  const html2 = await fetchSafe('https://www.hamariweb.com/finance/petrol-prices-in-pakistan/');
+  if (html2) {
+    const $ = cheerio.load(html2);
+    $('table tr').each((i, row) => parseFuelRow($, row));
+    console.log('  Source 2 (hamariweb fuel) done');
+  }
+
+  // SOURCE 3: PSO (Pakistan State Oil) — official govt source
+  const html3 = await fetchSafe('https://www.psopk.com/retail-fuels/fuel-prices');
+  if (html3) {
+    const $ = cheerio.load(html3);
+    $('table tr, .price-row').each((i, row) => parseFuelRow($, row));
+    console.log('  Source 3 (PSO) done');
+  }
+
+  const result = {
+    petrol:     bestRate(b.petrol,     'median', 'petrol')     || FALLBACK.petrol,
+    diesel:     bestRate(b.diesel,     'median', 'diesel')      || FALLBACK.diesel,
+    kerosene:   bestRate(b.kerosene,   'median', 'kerosene')   || FALLBACK.kerosene,
+    lightDiesel:bestRate(b.lightDiesel,'median', 'lightDiesel')|| FALLBACK.lightDiesel
+  };
+  console.log('  Final fuel:', result);
+  return result;
 }
 
 // ============================================================
-// CATEGORY 4: CRYPTO (8)
+// CATEGORY 4: CRYPTO
+// Source 1: CoinGecko API     (free, reliable)
+// Source 2: CoinCap API       (free, no key needed)
+// Source 3: Binance API       (official exchange prices)
 // ============================================================
 async function scrapeCrypto() {
-  try {
-    const res = await axios.get(
-      'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,binancecoin,solana,ripple,cardano,dogecoin,tron&vs_currencies=usd',
-      { timeout: 15000 }
-    );
-    const d = res.data;
-    const result = {
-      bitcoin: d.bitcoin?.usd || 67000,
-      ethereum: d.ethereum?.usd || 2050,
-      bnb: d.binancecoin?.usd || 580,
-      solana: d.solana?.usd || 130,
-      xrp: d.ripple?.usd || 2.1,
-      cardano: d.cardano?.usd || 0.65,
-      dogecoin: d.dogecoin?.usd || 0.17,
-      tron: d.tron?.usd || 0.23
-    };
-    console.log('Crypto scraped:', result);
-    return result;
-  } catch (e) {
-    console.log('Crypto scrape fail, fallback:', e.message);
-    return { bitcoin: 67000, ethereum: 2050, bnb: 580, solana: 130, xrp: 2.1, cardano: 0.65, dogecoin: 0.17, tron: 0.23 };
+  console.log('\n[CRYPTO] Scraping 3 sources...');
+
+  const FALLBACK = { bitcoin: 67000, ethereum: 2050, bnb: 580, solana: 130, xrp: 2.1, cardano: 0.65, dogecoin: 0.17, tron: 0.23 };
+  const b = { bitcoin: [], ethereum: [], bnb: [], solana: [], xrp: [], cardano: [], dogecoin: [], tron: [] };
+
+  // SOURCE 1: CoinGecko
+  const cg = await fetchSafe(
+    'https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,binancecoin,solana,ripple,cardano,dogecoin,tron&vs_currencies=usd',
+    { headers: {} } // no browser headers for API
+  );
+  if (cg && typeof cg === 'object') {
+    if (cg.bitcoin?.usd)     b.bitcoin.push(cg.bitcoin.usd);
+    if (cg.ethereum?.usd)    b.ethereum.push(cg.ethereum.usd);
+    if (cg.binancecoin?.usd) b.bnb.push(cg.binancecoin.usd);
+    if (cg.solana?.usd)      b.solana.push(cg.solana.usd);
+    if (cg.ripple?.usd)      b.xrp.push(cg.ripple.usd);
+    if (cg.cardano?.usd)     b.cardano.push(cg.cardano.usd);
+    if (cg.dogecoin?.usd)    b.dogecoin.push(cg.dogecoin.usd);
+    if (cg.tron?.usd)        b.tron.push(cg.tron.usd);
+    console.log('  Source 1 (CoinGecko) done');
   }
+
+  // SOURCE 2: CoinCap
+  const cc = await fetchSafe(
+    'https://api.coincap.io/v2/assets?ids=bitcoin,ethereum,binance-coin,solana,xrp,cardano,dogecoin,tron&limit=10',
+    { headers: {} }
+  );
+  if (cc?.data && Array.isArray(cc.data)) {
+    cc.data.forEach(coin => {
+      const p = parseFloat(coin.priceUsd);
+      if (!p) return;
+      if (coin.id === 'bitcoin')      b.bitcoin.push(p);
+      if (coin.id === 'ethereum')     b.ethereum.push(p);
+      if (coin.id === 'binance-coin') b.bnb.push(p);
+      if (coin.id === 'solana')       b.solana.push(p);
+      if (coin.id === 'xrp')         b.xrp.push(p);
+      if (coin.id === 'cardano')      b.cardano.push(p);
+      if (coin.id === 'dogecoin')     b.dogecoin.push(p);
+      if (coin.id === 'tron')         b.tron.push(p);
+    });
+    console.log('  Source 2 (CoinCap) done');
+  }
+
+  // SOURCE 3: Binance ticker API
+  const symbols = ['BTCUSDT','ETHUSDT','BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','TRXUSDT'];
+  const binance = await fetchSafe(
+    `https://api.binance.com/api/v3/ticker/price?symbols=${JSON.stringify(symbols)}`,
+    { headers: {} }
+  );
+  if (binance && Array.isArray(binance)) {
+    binance.forEach(t => {
+      const p = parseFloat(t.price);
+      if (!p) return;
+      if (t.symbol === 'BTCUSDT')  b.bitcoin.push(p);
+      if (t.symbol === 'ETHUSDT')  b.ethereum.push(p);
+      if (t.symbol === 'BNBUSDT')  b.bnb.push(p);
+      if (t.symbol === 'SOLUSDT')  b.solana.push(p);
+      if (t.symbol === 'XRPUSDT')  b.xrp.push(p);
+      if (t.symbol === 'ADAUSDT')  b.cardano.push(p);
+      if (t.symbol === 'DOGEUSDT') b.dogecoin.push(p);
+      if (t.symbol === 'TRXUSDT')  b.tron.push(p);
+    });
+    console.log('  Source 3 (Binance) done');
+  }
+
+  const result = {};
+  Object.keys(FALLBACK).forEach(k => {
+    result[k] = bestRate(b[k], 'median', k) || FALLBACK[k];
+  });
+  console.log('  Final crypto:', result);
+  return result;
 }
 
 // ============================================================
-// CATEGORY 5: PSX STOCKS (3)
+// CATEGORY 5: PSX STOCKS
+// Source 1: dps.psx.com.pk/indices  (official PSX)
+// Source 2: psx.com.pk              (main PSX site)
+// Source 3: investing.com Pakistan  (international tracker)
 // ============================================================
 async function scrapeStocks() {
-  try {
-    const res = await axios.get('https://dps.psx.com.pk/indices', {
-      timeout: 15000, headers: BROWSER_HEADERS
-    });
-    const $ = cheerio.load(res.data);
-    let kse100 = 115000, kse30 = 35000, kmi30 = 52000;
+  console.log('\n[STOCKS] Scraping 3 sources...');
 
-    $('table tr').each((i, row) => {
-      const text = $(row).text();
-      const cells = $(row).find('td');
-      if (cells.length < 2) return;
-      const val = parseFloat($(cells[1]).text().replace(/,/g, '').trim());
-      if (!val || val <= 0) return;
-      if (text.includes('KSE-100') || text.includes('KSE100')) kse100 = val;
-      else if (text.includes('KSE-30') || text.includes('KSE30')) kse30 = val;
-      else if (text.includes('KMI-30') || text.includes('KMI30')) kmi30 = val;
-    });
+  const FALLBACK = { kse100: 115000, kse30: 35000, kmi30: 52000 };
+  const b = { kse100: [], kse30: [], kmi30: [] };
 
-    console.log('Stocks scraped:', { kse100, kse30, kmi30 });
-    return { kse100, kse30, kmi30 };
-  } catch (e) {
-    console.log('Stocks scrape fail, fallback:', e.message);
-    return { kse100: 115000, kse30: 35000, kmi30: 52000 };
+  function parseStockRow($, row) {
+    const text = $(row).text();
+    const cells = $(row).find('td');
+    if (cells.length < 2) return;
+    const val = parseFloat($(cells[1]).text().replace(/,/g, '').trim());
+    if (!val || val <= 0) return;
+    if (/KSE.?100/i.test(text)) b.kse100.push(val);
+    if (/KSE.?30/i.test(text))  b.kse30.push(val);
+    if (/KMI.?30/i.test(text))  b.kmi30.push(val);
   }
+
+  // SOURCE 1: PSX DPS (official data portal)
+  const html1 = await fetchSafe('https://dps.psx.com.pk/indices');
+  if (html1) {
+    const $ = cheerio.load(html1);
+    $('table tr').each((i, row) => parseStockRow($, row));
+    console.log('  Source 1 (dps.psx.com.pk) done');
+  }
+
+  // SOURCE 2: PSX main site
+  const html2 = await fetchSafe('https://www.psx.com.pk/');
+  if (html2) {
+    const $ = cheerio.load(html2);
+    $('table tr, [class*="index"], [class*="Index"]').each((i, row) => {
+      const text = $(row).text();
+      // Try to extract a number from the row
+      const numMatch = text.replace(/,/g, '').match(/\d{5,7}(\.\d+)?/);
+      if (!numMatch) return;
+      const val = parseFloat(numMatch[0]);
+      if (!val || val <= 0) return;
+      if (/KSE.?100/i.test(text)) b.kse100.push(val);
+      if (/KSE.?30/i.test(text))  b.kse30.push(val);
+      if (/KMI.?30/i.test(text))  b.kmi30.push(val);
+    });
+    console.log('  Source 2 (psx.com.pk) done');
+  }
+
+  // SOURCE 3: hamariweb stocks
+  const html3 = await fetchSafe('https://www.hamariweb.com/finance/pakistan-stock-exchange/');
+  if (html3) {
+    const $ = cheerio.load(html3);
+    $('table tr, [class*="index"]').each((i, row) => parseStockRow($, row));
+    console.log('  Source 3 (hamariweb stocks) done');
+  }
+
+  const result = {
+    kse100: bestRate(b.kse100, 'median', 'kse100') || FALLBACK.kse100,
+    kse30:  bestRate(b.kse30,  'median', 'kse30')  || FALLBACK.kse30,
+    kmi30:  bestRate(b.kmi30,  'median', 'kmi30')  || FALLBACK.kmi30
+  };
+  console.log('  Final stocks:', result);
+  return result;
 }
 
 // ============================================================
-// CATEGORY 6: ELECTRICITY (3) - Static (NEPRA regulated)
+// CATEGORY 6: ELECTRICITY
+// Source 1: NEPRA official tariff page
+// Source 2: LESCO tariff page
+// Source 3: hamariweb electricity prices
+// Note: Rates change quarterly — scraping + hardcoded fallback
 // ============================================================
-function getElectricity() {
-  return { normal: 47, peak: 58, offpeak: 36 };
+async function scrapeElectricity() {
+  console.log('\n[ELECTRICITY] Scraping 3 sources...');
+
+  // Current NEPRA approved rates (fallback if scraping fails)
+  const FALLBACK = { normal: 47, peak: 58, offpeak: 36 };
+  const b = { normal: [], peak: [], offpeak: [] };
+
+  function parseElecRow($, row) {
+    const text = $(row).text().toLowerCase();
+    const cells = $(row).find('td');
+    if (cells.length < 2) return;
+    const val = parseFloat($(cells[cells.length - 1]).text().replace(/,/g, '').trim());
+    if (!val || val <= 0 || val > 200) return; // sanity: electricity rate 200 se zyada nahi
+    if (text.includes('peak') && !text.includes('off')) b.peak.push(val);
+    else if (text.includes('off') && text.includes('peak'))  b.offpeak.push(val);
+    else if (text.includes('normal') || text.includes('unit') || text.includes('per kwh')) b.normal.push(val);
+  }
+
+  // SOURCE 1: NEPRA
+  const html1 = await fetchSafe('https://www.nepra.org.pk/tariff/index.php');
+  if (html1) {
+    const $ = cheerio.load(html1);
+    $('table tr').each((i, row) => parseElecRow($, row));
+    console.log('  Source 1 (NEPRA) done');
+  }
+
+  // SOURCE 2: LESCO tariff
+  const html2 = await fetchSafe('https://lesco.com.pk/tariff/');
+  if (html2) {
+    const $ = cheerio.load(html2);
+    $('table tr').each((i, row) => parseElecRow($, row));
+    console.log('  Source 2 (LESCO) done');
+  }
+
+  // SOURCE 3: hamariweb electricity
+  const html3 = await fetchSafe('https://www.hamariweb.com/finance/electricity-rates-in-pakistan/');
+  if (html3) {
+    const $ = cheerio.load(html3);
+    $('table tr').each((i, row) => parseElecRow($, row));
+    console.log('  Source 3 (hamariweb electricity) done');
+  }
+
+  const result = {
+    normal:  bestRate(b.normal,  'median', 'elec_normal')  || FALLBACK.normal,
+    peak:    bestRate(b.peak,    'median', 'elec_peak')    || FALLBACK.peak,
+    offpeak: bestRate(b.offpeak, 'median', 'elec_offpeak') || FALLBACK.offpeak
+  };
+  console.log('  Final electricity:', result);
+  return result;
 }
 
 // ============================================================
-// CATEGORY 7: AGRICULTURE (4)
+// CATEGORY 7: AGRICULTURE
+// Source 1: priceit.pk          (commodity prices)
+// Source 2: hamariweb agri      (commodity rates)
+// Source 3: agrifind.pk         (Pakistan agri prices)
 // ============================================================
 async function scrapeAgriculture() {
-  try {
-    const res = await axios.get('https://priceit.pk/wheat-price-in-pakistan/', {
-      timeout: 15000, headers: BROWSER_HEADERS
-    });
-    const $ = cheerio.load(res.data);
-    let wheat = 2500;
-    $('table tr').each((i, row) => {
-      const text = $(row).text().toLowerCase();
-      if (text.includes('punjab') || text.includes('per kg')) {
-        const val = parseFloat($(row).find('td').last().text().replace(/,/g, '').replace('rs', '').trim());
-        if (val > 0 && val < 500) wheat = val;
-      }
-    });
-    console.log('Agriculture wheat scraped:', wheat);
-    return {
-      wheat,
-      rice: 175,
-      sugar: 155,
-      cotton: 8500
-    };
-  } catch (e) {
-    console.log('Agriculture scrape fail, fallback:', e.message);
-    return { wheat: 2500, rice: 175, sugar: 155, cotton: 8500 };
+  console.log('\n[AGRICULTURE] Scraping 3 sources...');
+
+  const FALLBACK = { wheat: 65, rice: 175, sugar: 155, cotton: 8500 };
+  const b = { wheat: [], rice: [], sugar: [], cotton: [] };
+
+  function parseAgriRow($, row, source) {
+    const text = $(row).text().toLowerCase();
+    const cells = $(row).find('td');
+    // Try last cell first, then second cell
+    const rawVal = cells.length > 1
+      ? $(cells[cells.length - 1]).text()
+      : $(row).text();
+    const val = parseFloat(rawVal.replace(/,/g, '').replace(/rs\.?/gi, '').trim());
+    if (!val || val <= 0) return;
+
+    // Wheat: per 40kg = ~2600, per kg = ~65
+    if (text.includes('wheat') || text.includes('gandum')) {
+      if (val > 500 && val < 5000)       b.wheat.push(Math.round(val / 40)); // per 40kg → per kg
+      else if (val > 30 && val < 500)    b.wheat.push(val); // already per kg
+    }
+    // Rice: per kg ~175
+    if ((text.includes('rice') || text.includes('chawal')) && val > 50 && val < 1000) b.rice.push(val);
+    // Sugar: per kg ~155
+    if ((text.includes('sugar') || text.includes('cheeni')) && val > 50 && val < 500) b.sugar.push(val);
+    // Cotton: per 40kg ~8500
+    if (text.includes('cotton') || text.includes('kapas')) {
+      if (val > 1000)  b.cotton.push(val);
+    }
   }
+
+  // SOURCE 1: priceit.pk
+  const html1 = await fetchSafe('https://priceit.pk/commodity-prices/');
+  if (html1) {
+    const $ = cheerio.load(html1);
+    $('table tr').each((i, row) => parseAgriRow($, row, 'priceit'));
+    console.log('  Source 1 (priceit.pk) done');
+  }
+
+  // SOURCE 2: hamariweb agriculture
+  const html2 = await fetchSafe('https://www.hamariweb.com/finance/commodity-prices-in-pakistan/');
+  if (html2) {
+    const $ = cheerio.load(html2);
+    $('table tr').each((i, row) => parseAgriRow($, row, 'hamariweb'));
+    console.log('  Source 2 (hamariweb agri) done');
+  }
+
+  // SOURCE 3: Kissan Pakistan
+  const html3 = await fetchSafe('https://www.kissanpakistan.com/commodity-prices/');
+  if (html3) {
+    const $ = cheerio.load(html3);
+    $('table tr, .price-item').each((i, row) => parseAgriRow($, row, 'kissanpakistan'));
+    console.log('  Source 3 (kissanpakistan) done');
+  }
+
+  const result = {
+    wheat:  bestRate(b.wheat,  'median', 'wheat')  || FALLBACK.wheat,
+    rice:   bestRate(b.rice,   'median', 'rice')   || FALLBACK.rice,
+    sugar:  bestRate(b.sugar,  'median', 'sugar')  || FALLBACK.sugar,
+    cotton: bestRate(b.cotton, 'median', 'cotton') || FALLBACK.cotton
+  };
+  console.log('  Final agriculture:', result);
+  return result;
 }
 
 // ============================================================
-// CATEGORY 8: PROPERTY (3) - Static (quarterly update)
+// CATEGORY 8: PROPERTY (per sq ft, PKR)
+// Source 1: zameen.com          (Pakistan's biggest property site)
+// Source 2: graana.com          (property listings)
+// Source 3: lamudi.pk           (property classifieds)
+// Note: Semi-static — scraping averages from listings
 // ============================================================
-function getProperty() {
-  return { lahore: 1250000, karachi: 1500000, islamabad: 2000000 };
+async function scrapeProperty() {
+  console.log('\n[PROPERTY] Scraping 3 sources...');
+
+  // Per sq ft rates (rough market averages)
+  const FALLBACK = { lahore: 1250000, karachi: 1500000, islamabad: 2000000 };
+  const b = { lahore: [], karachi: [], islamabad: [] };
+
+  function extractCityRates($, html, label) {
+    // Look for price mentions near city names in meta/structured content
+    const text = $.text ? $.text() : '';
+    const lines = text.split('\n').filter(l => l.trim().length > 3);
+    lines.forEach(line => {
+      const lower = line.toLowerCase();
+      const numMatch = line.replace(/,/g, '').match(/(\d{6,9})/);
+      if (!numMatch) return;
+      const val = parseInt(numMatch[1]);
+      if (val < 100000 || val > 50000000) return; // marla/sq ft range sanity
+      if (lower.includes('lahore'))    b.lahore.push(val);
+      if (lower.includes('karachi'))   b.karachi.push(val);
+      if (lower.includes('islamabad')) b.islamabad.push(val);
+    });
+  }
+
+  // SOURCE 1: zameen property index
+  const html1 = await fetchSafe('https://www.zameen.com/property-index/');
+  if (html1) {
+    const $ = cheerio.load(html1);
+    extractCityRates($, html1, 'zameen');
+    // Also try structured table/div data
+    $('[class*="city"], [class*="price"], table tr').each((i, el) => {
+      const text = $(el).text().toLowerCase();
+      const numMatch = $(el).text().replace(/,/g, '').match(/(\d{6,9})/);
+      if (!numMatch) return;
+      const val = parseInt(numMatch[1]);
+      if (val < 100000 || val > 50000000) return;
+      if (text.includes('lahore'))    b.lahore.push(val);
+      if (text.includes('karachi'))   b.karachi.push(val);
+      if (text.includes('islamabad')) b.islamabad.push(val);
+    });
+    console.log('  Source 1 (zameen.com) done');
+  }
+
+  // SOURCE 2: graana property trends
+  const html2 = await fetchSafe('https://www.graana.com/property-insights/');
+  if (html2) {
+    const $ = cheerio.load(html2);
+    extractCityRates($, html2, 'graana');
+    console.log('  Source 2 (graana.com) done');
+  }
+
+  // SOURCE 3: hamariweb property
+  const html3 = await fetchSafe('https://www.hamariweb.com/real-estate/property-prices-in-pakistan/');
+  if (html3) {
+    const $ = cheerio.load(html3);
+    $('table tr').each((i, row) => {
+      const text = $(row).text().toLowerCase();
+      const cells = $(row).find('td');
+      if (cells.length < 2) return;
+      const val = parseInt($(cells[1]).text().replace(/,/g, '').trim());
+      if (!val || val < 100000) return;
+      if (text.includes('lahore'))    b.lahore.push(val);
+      if (text.includes('karachi'))   b.karachi.push(val);
+      if (text.includes('islamabad')) b.islamabad.push(val);
+    });
+    console.log('  Source 3 (hamariweb property) done');
+  }
+
+  const result = {
+    lahore:    bestRate(b.lahore,    'median', 'lahore')    || FALLBACK.lahore,
+    karachi:   bestRate(b.karachi,   'median', 'karachi')   || FALLBACK.karachi,
+    islamabad: bestRate(b.islamabad, 'median', 'islamabad') || FALLBACK.islamabad
+  };
+  console.log('  Final property:', result);
+  return result;
 }
 
 // ============================================================
@@ -257,88 +687,72 @@ function getProperty() {
 // ============================================================
 async function scrapeAll() {
   console.log('\n========================================');
-  console.log('DailyPak Scraper — 40 Rates Shuru...');
+  console.log('DailyPak Multi-Source Scraper — 40 Rates');
   console.log('========================================\n');
 
-  const currencies = await scrapeCurrencies();
-  const metals = await scrapeMetals();
-  const fuel = await scrapeFuel();
-  const crypto = await scrapeCrypto();
-  const stocks = await scrapeStocks();
-  const electricity = getElectricity();
-  const agriculture = await scrapeAgriculture();
-  const property = getProperty();
+  const [currencies, metals, fuel, crypto, stocks, electricity, agriculture, property] = await Promise.allSettled([
+    scrapeCurrencies(),
+    scrapeMetals(),
+    scrapeFuel(),
+    scrapeCrypto(),
+    scrapeStocks(),
+    scrapeElectricity(),
+    scrapeAgriculture(),
+    scrapeProperty()
+  ]).then(results => results.map((r, i) => {
+    if (r.status === 'rejected') {
+      console.log(`  ❌ Category ${i} failed:`, r.reason?.message);
+      return null;
+    }
+    return r.value;
+  }));
 
   // Purani history KV se lo
   let history = await kvGet('history');
   if (!history || typeof history !== 'object') history = {};
 
-  // ---- CURRENCIES history ----
-  updateHistory(history, 'usd', currencies.usd);
-  updateHistory(history, 'aed', currencies.aed);
-  updateHistory(history, 'sar', currencies.sar);
-  updateHistory(history, 'eur', currencies.eur);
-  updateHistory(history, 'gbp', currencies.gbp);
-  updateHistory(history, 'cny', currencies.cny);
-  updateHistory(history, 'try', currencies.try);
-  updateHistory(history, 'cad', currencies.cad);
-  updateHistory(history, 'aud', currencies.aud);
-  updateHistory(history, 'qar', currencies.qar);
+  // ---- Update history for all rates ----
+  const allRates = [
+    // currencies
+    ['usd', currencies?.usd], ['aed', currencies?.aed], ['sar', currencies?.sar],
+    ['eur', currencies?.eur], ['gbp', currencies?.gbp], ['cny', currencies?.cny],
+    ['try', currencies?.try], ['cad', currencies?.cad], ['aud', currencies?.aud],
+    ['qar', currencies?.qar],
+    // metals
+    ['gold24k', metals?.gold24k], ['gold22k', metals?.gold22k],
+    ['goldGram', metals?.goldGram], ['silverTola', metals?.silverTola],
+    ['platinum', metals?.platinum],
+    // fuel
+    ['petrol', fuel?.petrol], ['diesel', fuel?.diesel],
+    ['kerosene', fuel?.kerosene], ['lightDiesel', fuel?.lightDiesel],
+    // crypto
+    ['bitcoin', crypto?.bitcoin], ['ethereum', crypto?.ethereum],
+    ['bnb', crypto?.bnb], ['solana', crypto?.solana], ['xrp', crypto?.xrp],
+    ['cardano', crypto?.cardano], ['dogecoin', crypto?.dogecoin], ['tron', crypto?.tron],
+    // stocks
+    ['kse100', stocks?.kse100], ['kse30', stocks?.kse30], ['kmi30', stocks?.kmi30],
+    // electricity
+    ['elec_normal', electricity?.normal], ['elec_peak', electricity?.peak],
+    ['elec_offpeak', electricity?.offpeak],
+    // agriculture
+    ['wheat', agriculture?.wheat], ['rice', agriculture?.rice],
+    ['sugar', agriculture?.sugar], ['cotton', agriculture?.cotton],
+    // property
+    ['prop_lahore', property?.lahore], ['prop_karachi', property?.karachi],
+    ['prop_islamabad', property?.islamabad]
+  ];
 
-  // ---- METALS history ----
-  updateHistory(history, 'gold24k', metals.gold24k);
-  updateHistory(history, 'gold22k', metals.gold22k);
-  updateHistory(history, 'goldGram', metals.goldGram);
-  updateHistory(history, 'silverTola', metals.silverTola);
-  updateHistory(history, 'platinum', metals.platinum);
+  allRates.forEach(([key, val]) => { if (val) updateHistory(history, key, val); });
 
-  // ---- FUEL history ----
-  updateHistory(history, 'petrol', fuel.petrol);
-  updateHistory(history, 'diesel', fuel.diesel);
-  updateHistory(history, 'kerosene', fuel.kerosene);
-  updateHistory(history, 'lightDiesel', fuel.lightDiesel);
-
-  // ---- CRYPTO history ----
-  updateHistory(history, 'bitcoin', crypto.bitcoin);
-  updateHistory(history, 'ethereum', crypto.ethereum);
-  updateHistory(history, 'bnb', crypto.bnb);
-  updateHistory(history, 'solana', crypto.solana);
-  updateHistory(history, 'xrp', crypto.xrp);
-  updateHistory(history, 'cardano', crypto.cardano);
-  updateHistory(history, 'dogecoin', crypto.dogecoin);
-  updateHistory(history, 'tron', crypto.tron);
-
-  // ---- STOCKS history ----
-  updateHistory(history, 'kse100', stocks.kse100);
-  updateHistory(history, 'kse30', stocks.kse30);
-  updateHistory(history, 'kmi30', stocks.kmi30);
-
-  // ---- AGRICULTURE history ----
-  updateHistory(history, 'wheat', agriculture.wheat);
-  updateHistory(history, 'rice', agriculture.rice);
-  updateHistory(history, 'sugar', agriculture.sugar);
-  updateHistory(history, 'cotton', agriculture.cotton);
-
-  // ---- ELECTRICITY history ----
-  updateHistory(history, 'elec_normal', electricity.normal);
-  updateHistory(history, 'elec_peak', electricity.peak);
-  updateHistory(history, 'elec_offpeak', electricity.offpeak);
-
-  // ---- PROPERTY history ----
-  updateHistory(history, 'prop_lahore', property.lahore);
-  updateHistory(history, 'prop_karachi', property.karachi);
-  updateHistory(history, 'prop_islamabad', property.islamabad);
-
-  // Final data object
   const data = {
-    currencies,
-    metals,
-    fuel,
-    crypto,
-    stocks,
-    electricity,
-    agriculture,
-    property,
+    currencies:   currencies   || {},
+    metals:       metals       || {},
+    fuel:         fuel         || {},
+    crypto:       crypto       || {},
+    stocks:       stocks       || {},
+    electricity:  electricity  || {},
+    agriculture:  agriculture  || {},
+    property:     property     || {},
     updated: new Date().toLocaleString('en-PK', {
       timeZone: 'Asia/Karachi',
       dateStyle: 'medium',
@@ -346,22 +760,22 @@ async function scrapeAll() {
     })
   };
 
-  // Save to Cloudflare KV
   await kvSet('rates', data);
   await kvSet('history', history);
 
   console.log('\n========================================');
-  console.log('Data saved! Summary:');
-  console.log(`  Currencies : ${Object.keys(currencies).length} rates`);
-  console.log(`  Metals     : ${Object.keys(metals).length} rates`);
-  console.log(`  Fuel       : ${Object.keys(fuel).length} rates`);
-  console.log(`  Crypto     : ${Object.keys(crypto).length} rates`);
-  console.log(`  Stocks     : ${Object.keys(stocks).length} rates`);
-  console.log(`  Electricity: ${Object.keys(electricity).length} rates`);
-  console.log(`  Agriculture: ${Object.keys(agriculture).length} rates`);
-  console.log(`  Property   : ${Object.keys(property).length} rates`);
-  console.log(`  TOTAL      : 40 rates`);
-  console.log(`  History    : 30 din ka data save`);
+  console.log('✅ All done! Sources used per category:');
+  console.log('  Currencies  : hamariweb | pkr.com.pk | forex.pk');
+  console.log('  Metals      : bullion.pk | goldratepk.com | gold.com.pk');
+  console.log('  Fuel        : pakwheels | hamariweb | PSO');
+  console.log('  Crypto      : CoinGecko | CoinCap | Binance');
+  console.log('  Stocks      : dps.psx.com.pk | psx.com.pk | hamariweb');
+  console.log('  Electricity : NEPRA | LESCO | hamariweb');
+  console.log('  Agriculture : priceit.pk | hamariweb | kissanpakistan');
+  console.log('  Property    : zameen.com | graana.com | hamariweb');
+  console.log('  Best Rate   : Median strategy (outliers auto-reject)');
+  console.log('  Total Rates : 40');
+  console.log('  History     : 30 din ka data');
   console.log('========================================\n');
 }
 
